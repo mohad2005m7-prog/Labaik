@@ -153,9 +153,13 @@ internal sealed class IdentityService(
         => Error.Failure(code, string.Join(" ", result.Errors.Select(e => e.Description)));
 
     // Every token issue (login, verify, Google, refresh) goes through here, so the bootstrap
-    // Admin grant takes effect without a restart, and a suspended supervisor is refused.
+    // Admin grant takes effect without a restart, and a disabled account or suspended supervisor is refused.
     private async Task<Result<AuthUser>> BuildAuthUserAsync(ApplicationUser user)
     {
+        if (await userManager.IsLockedOutAsync(user))
+        {
+            return Error.Forbidden("Auth.AccountDisabled", "This account is disabled.");
+        }
         await EnsureBootstrapAdminAsync(user);
         var roles = await userManager.GetRolesAsync(user);
         if (roles.Contains(Roles.Supervisor) && !roles.Contains(Roles.Admin) && await IsSuspendedEverywhereAsync(user.Id))
@@ -163,7 +167,7 @@ internal sealed class IdentityService(
             return Error.Forbidden("Supervisor.Suspended", "This supervisor account is suspended by its company.");
         }
 
-        return new AuthUser(user.Id, user.Email!, user.FullName, roles.ToList());
+        return new AuthUser(user.Id, user.Email!, user.FullName, roles.ToList(), user.MustChangePassword);
     }
 
     // On at least one company roster and suspended on all of them.
@@ -213,7 +217,8 @@ internal sealed class IdentityService(
     }
 
     public async Task<Result<ProvisionedAccount>> ProvisionAccountAsync(
-        string fullName, string email, string? phoneNumber, string? role, CancellationToken cancellationToken = default)
+        string fullName, string email, string? phoneNumber, string? role, string? requestedPassword = null,
+        bool mustChangePassword = true, CancellationToken cancellationToken = default)
     {
         fullName = fullName.Trim();
         email = email.Trim();
@@ -224,7 +229,7 @@ internal sealed class IdentityService(
 
         if (user is null)
         {
-            temporaryPassword = GenerateTemporaryPassword();
+            temporaryPassword = requestedPassword ?? GenerateTemporaryPassword();
             user = new ApplicationUser
             {
                 Id = Guid.NewGuid(),
@@ -232,7 +237,8 @@ internal sealed class IdentityService(
                 Email = email,
                 UserName = email,
                 PhoneNumber = phoneNumber,
-                EmailConfirmed = true // provisioned by a trusted admin/company: no OTP
+                EmailConfirmed = true, // provisioned by a trusted admin/company: no OTP
+                MustChangePassword = mustChangePassword
             };
 
             var created = await userManager.CreateAsync(user, temporaryPassword);
@@ -242,7 +248,7 @@ internal sealed class IdentityService(
         {
             // Whoever registered this account never proved owning the email: replace their password
             // with a temporary one sent to the real address (same anti-squatting rule as Google sign-in).
-            temporaryPassword = GenerateTemporaryPassword();
+            temporaryPassword = requestedPassword ?? GenerateTemporaryPassword();
             if (await userManager.HasPasswordAsync(user))
             {
                 var removed = await userManager.RemovePasswordAsync(user);
@@ -255,6 +261,7 @@ internal sealed class IdentityService(
             user.FullName = fullName;
             user.PhoneNumber = phoneNumber ?? user.PhoneNumber;
             user.EmailConfirmed = true;
+            user.MustChangePassword = mustChangePassword;
             var updated = await userManager.UpdateAsync(user);
             if (!updated.Succeeded) return IdentityFailure("User.CreationFailed", updated);
             await refreshTokenService.RevokeAllForUserAsync(user.Id, cancellationToken);
@@ -342,15 +349,70 @@ internal sealed class IdentityService(
             : await BuildAuthUserAsync(user);
     }
 
+    public async Task<Result<AuthUser>> ChangePasswordAsync(
+        Guid userId, string currentPassword, string newPassword, CancellationToken cancellationToken = default)
+    {
+        var user = await userManager.FindByIdAsync(userId.ToString());
+        if (user is null) return Error.NotFound("User.NotFound", "No account found.");
+
+        var changed = await userManager.ChangePasswordAsync(user, currentPassword, newPassword);
+        if (!changed.Succeeded)
+        {
+            return changed.Errors.Any(e => e.Code == "PasswordMismatch")
+                ? Error.Unauthorized("Auth.InvalidCredentials", "The current password is incorrect.")
+                : IdentityFailure("Auth.ChangePasswordFailed", changed);
+        }
+
+        user.MustChangePassword = false;
+        var updated = await userManager.UpdateAsync(user);
+        if (!updated.Succeeded) return IdentityFailure("Auth.ChangePasswordFailed", updated);
+        await refreshTokenService.RevokeAllForUserAsync(user.Id, cancellationToken);
+        return await BuildAuthUserAsync(user);
+    }
+
+    public async Task<Result<string>> IssueTemporaryPasswordAsync(Guid userId, CancellationToken cancellationToken = default)
+    {
+        var user = await userManager.FindByIdAsync(userId.ToString());
+        if (user is null) return Error.NotFound("User.NotFound", "No account found.");
+
+        var password = GenerateTemporaryPassword();
+        if (await userManager.HasPasswordAsync(user))
+        {
+            var removed = await userManager.RemovePasswordAsync(user);
+            if (!removed.Succeeded) return IdentityFailure("User.PasswordResetFailed", removed);
+        }
+        var added = await userManager.AddPasswordAsync(user, password);
+        if (!added.Succeeded) return IdentityFailure("User.PasswordResetFailed", added);
+
+        user.MustChangePassword = true;
+        var updated = await userManager.UpdateAsync(user);
+        if (!updated.Succeeded) return IdentityFailure("User.PasswordResetFailed", updated);
+        await refreshTokenService.RevokeAllForUserAsync(user.Id, cancellationToken);
+        return password;
+    }
+
+    public async Task<Result> SetDisabledAsync(Guid userId, bool disabled, CancellationToken cancellationToken = default)
+    {
+        var user = await userManager.FindByIdAsync(userId.ToString());
+        if (user is null) return Result.Failure(Error.NotFound("User.NotFound", "No account found."));
+        await userManager.SetLockoutEnabledAsync(user, true);
+        var updated = await userManager.SetLockoutEndDateAsync(user, disabled ? DateTimeOffset.MaxValue : null);
+        if (!updated.Succeeded) return Result.Failure(IdentityFailure("Auth.AccountDisabled", updated));
+        if (disabled) await refreshTokenService.RevokeAllForUserAsync(user.Id, cancellationToken);
+        return Result.Success();
+    }
+
     public async Task<Result> ResendEmailConfirmationAsync(string email, CancellationToken cancellationToken = default)
     {
         var user = await userManager.FindByEmailAsync(email);
-        if (user is null || user.EmailConfirmed)
+        if (user is null)
         {
-            return Result.Success(); // do not reveal existence / nothing to resend
+            return Result.Success(); // do not reveal existence
         }
+
+        var purpose = user.EmailConfirmed ? VerificationPurpose.PasswordReset : VerificationPurpose.EmailConfirmation;
         return await verificationCodeService.GenerateAndSendAsync(
-            user.Id, email, VerificationPurpose.EmailConfirmation, cancellationToken);
+            user.Id, email, purpose, cancellationToken);
     }
 
     public async Task<Result> ForgotPasswordAsync(string email, CancellationToken cancellationToken = default)
@@ -362,27 +424,6 @@ internal sealed class IdentityService(
                 user.Id, email, VerificationPurpose.PasswordReset, cancellationToken);
         }
         return Result.Success(); // always 200: no user enumeration
-    }
-
-    public async Task<Result<ProvisionedAccount>> IssueTemporaryPasswordAsync(Guid userId, CancellationToken cancellationToken = default)
-    {
-        var user = await userManager.FindByIdAsync(userId.ToString());
-        if (user is null)
-        {
-            return Error.NotFound("User.NotFound", "No account found.");
-        }
-
-        var temporaryPassword = GenerateTemporaryPassword();
-        var resetToken = await userManager.GeneratePasswordResetTokenAsync(user);
-        var reset = await userManager.ResetPasswordAsync(user, resetToken, temporaryPassword);
-        if (!reset.Succeeded)
-        {
-            return IdentityFailure("Auth.ResetFailed", reset);
-        }
-
-        await refreshTokenService.RevokeAllForUserAsync(user.Id, cancellationToken);
-        logger.LogInformation("Issued a new temporary password for user {UserId}.", user.Id);
-        return new ProvisionedAccount(user.Id, user.Email!, user.FullName, temporaryPassword);
     }
 
     public async Task<Result> ResetPasswordAsync(
@@ -408,6 +449,10 @@ internal sealed class IdentityService(
             return Result.Failure(Error.Failure("Auth.ResetFailed",
                 string.Join(" ", result.Errors.Select(e => e.Description))));
         }
+
+        user.MustChangePassword = false;
+        var updated = await userManager.UpdateAsync(user);
+        if (!updated.Succeeded) return Result.Failure(IdentityFailure("Auth.ResetFailed", updated));
 
         await refreshTokenService.RevokeAllForUserAsync(user.Id, cancellationToken); // invalidate old sessions
         return Result.Success();

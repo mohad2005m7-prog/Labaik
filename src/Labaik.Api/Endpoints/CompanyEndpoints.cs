@@ -4,7 +4,8 @@ using Labaik.Api.Extensions;
 using Labaik.Api.OpenApi;
 using Labaik.Application.Features.Announcements.Commands.PostCompanyAnnouncement;
 using Labaik.Application.Features.Companies.Commands.AddCompanySupervisor;
-using Labaik.Application.Features.Companies.Commands.IssueSupervisorTemporaryPassword;
+using Labaik.Application.Features.Companies.Commands.IssueSupervisorTempPassword;
+using Labaik.Application.Common.Provisioning;
 using Labaik.Application.Features.Companies.Commands.RemoveCompanySupervisor;
 using Labaik.Application.Features.Companies.Commands.SetCompanySupervisorSuspended;
 using Labaik.Application.Features.Companies.Commands.UpdateMyCompany;
@@ -18,6 +19,8 @@ using Labaik.Application.Features.Groups.Commands.RemoveGroupMember;
 using Labaik.Application.Features.Groups.Queries.GetGroupMember;
 using Labaik.Application.Features.Groups.Queries.GetGroupMembers;
 using Labaik.Application.Features.Groups.Queries.GetTripGroups;
+using Labaik.Application.Features.Groups.Queries.GetCompanyGroups;
+using Labaik.Application.Features.Groups.Dtos;
 using Labaik.Application.Features.Trips.Commands.CreateTrip;
 using Labaik.Application.Features.Trips.Commands.UpdateTrip;
 using Labaik.Application.Features.Trips.Queries.GetCompanyTripById;
@@ -61,6 +64,15 @@ public static class CompanyEndpoints
         .WithResponseExample(StatusCodes.Status200OK, CompanyExamples.Company)
         .ProducesProblem(StatusCodes.Status409Conflict)
         .ProducesValidationProblem(StatusCodes.Status422UnprocessableEntity);
+
+        group.MapPost("/supervisors/{userId:guid}/temp-password", async (Guid userId, ISender sender, CancellationToken ct) =>
+        {
+            var result = await sender.Send(new IssueSupervisorTempPasswordCommand(userId), ct);
+            return result.IsSuccess ? Results.Ok(result.Value) : result.Error!.ToProblem();
+        })
+        .WithName("IssueSupervisorTemporaryPassword")
+        .WithSummary("Issue and email a new temporary password to a roster supervisor; returns the password once")
+        .Returns<TemporaryPasswordDto>().Fails(404);
 
         group.MapGet("/home", async (ISender sender, CancellationToken ct) =>
         {
@@ -125,15 +137,14 @@ public static class CompanyEndpoints
         .Produces(StatusCodes.Status204NoContent)
         .ProducesProblem(StatusCodes.Status404NotFound);
 
-        group.MapPost("/supervisors/{userId:guid}/temp-password", async (Guid userId, ISender sender, CancellationToken ct) =>
+        group.MapGet("/groups", async (ISender sender, CancellationToken ct) =>
         {
-            var result = await sender.Send(new IssueSupervisorTemporaryPasswordCommand(userId), ct);
+            var result = await sender.Send(new GetCompanyGroupsQuery(), ct);
             return result.IsSuccess ? Results.Ok(result.Value) : result.Error!.ToProblem();
         })
-        .WithName("IssueSupervisorTemporaryPassword")
-        .WithSummary("New temporary password for a supervisor on my roster (emailed, returned once; old password and sessions stop working)")
-        .Produces<TemporaryPasswordDto>()
-        .ProducesProblem(StatusCodes.Status404NotFound);
+        .WithName("GetCompanyGroups")
+        .WithSummary("All my groups across trips, soonest trip first")
+        .Returns<IReadOnlyList<CompanyGroupListItemDto>>().Fails(401);
 
         group.MapPost("/announcements", async (PostCompanyAnnouncementCommand command, ISender sender, CancellationToken ct) =>
         {

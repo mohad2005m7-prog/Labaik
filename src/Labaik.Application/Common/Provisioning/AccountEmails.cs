@@ -5,12 +5,11 @@ using Microsoft.Extensions.Logging;
 namespace Labaik.Application.Common.Provisioning;
 
 // Emails for accounts created top-down (admin -> company -> supervisor / pilgrim).
-// PRODUCTION TODO: the temporary password travels in plain text and is not forced to change on
-// first login (users change it via forgot/reset password). Add a forced change before production.
 public static class AccountEmails
 {
     // New account: login email + temporary password. Existing account: a notice without credentials.
-    public static (string Subject, string Body) For(ProvisionedAccount account, string accountKind, string? companyName)
+    public static (string Subject, string Body) For(
+        ProvisionedAccount account, string accountKind, string? companyName, string? downloadUrl = null)
     {
         var at = companyName is null ? string.Empty : $" for {companyName}";
 
@@ -20,13 +19,14 @@ public static class AccountEmails
                 $"""
                 Hello {account.FullName},
 
-                A Labaik {accountKind} account has been created for you{at}.
+                {companyName ?? "Labaik"} added you as a {accountKind}.
 
                 Sign in with:
                   Email: {account.Email}
                   Temporary password: {password}
 
-                Please change this password after your first sign-in using "Forgot password" in the app.
+                You will be asked to choose a new password on first sign-in.
+                {(string.IsNullOrWhiteSpace(downloadUrl) ? string.Empty : $"Download the app: {downloadUrl}")}
                 """);
         }
 
@@ -38,21 +38,6 @@ public static class AccountEmails
             Sign in with your current password. If you were already signed in, sign in again to see the change.
             """);
     }
-
-    // A new temporary password issued by the company (the previous one no longer works).
-    public static (string Subject, string Body) TemporaryPassword(ProvisionedAccount account, string companyName) =>
-        ("Your new Labaik temporary password",
-            $"""
-            Hello {account.FullName},
-
-            {companyName} issued a new temporary password for your Labaik account.
-
-            Sign in with:
-              Email: {account.Email}
-              Temporary password: {account.TemporaryPassword}
-
-            Your previous password no longer works. Please change this one after signing in.
-            """);
 
     // Email delivery must not undo a committed provisioning: failures are logged, not thrown.
     public static async Task<bool> TrySendAsync(
